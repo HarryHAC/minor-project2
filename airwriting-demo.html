@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Air Writing with Hand Tracking + Voice</title>
+  <style>
+    body { 
+      margin: 0; 
+      display: flex; 
+      justify-content: center; 
+      align-items: center; 
+      flex-direction: column; 
+      background: black; 
+      color: white; 
+      font-family: Arial; 
+    }
+    video, canvas {
+      border: 2px solid limegreen;
+      border-radius: 10px;
+    }
+    #container {
+      display: flex;
+      gap: 10px;
+    }
+    button {
+      margin-top: 15px;
+      padding: 10px 20px;
+      font-size: 16px;
+      border-radius: 8px;
+      border: none;
+      cursor: pointer;
+      background: limegreen;
+      color: black;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <h2>Air Writing with Hand Tracking (Left + Right)</h2>
+  <p id="status">✋ Show 5 fingers to START/STOP writing | ✊ Fist = Clear</p>
+  <div id="container">
+    <video id="video" autoplay playsinline style="transform: scaleX(-1);"></video>
+    <canvas id="drawCanvas" style="transform: scaleX(-1);"></canvas>
+  </div>
+
+  <button id="readBtn">🔊 Recognize & Speak</button>
+
+  <!-- MediaPipe Hands -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  
+  <!-- OCR (Tesseract.js) -->
+  <script src="https://cdn.jsdelivr.net/npm/tesseract.js@2/dist/tesseract.min.js"></script>
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('drawCanvas');
+    const ctx = canvas.getContext('2d');
+    const statusText = document.getElementById("status");
+    const readBtn = document.getElementById("readBtn");
+
+    video.width = 640; video.height = 480;
+    canvas.width = 640; canvas.height = 480;
+
+    let points = [];
+    let isWriting = false;
+
+    let lastGesture = null;
+    let gestureStartTime = 0;
+    const STABLE_TIME = 1000;
+
+    function countFingers(landmarks, handedness) {
+      let fingers = 0;
+      if (handedness === "Right") {
+        if (landmarks[4].x < landmarks[3].x) fingers++;
+      } else {
+        if (landmarks[4].x > landmarks[3].x) fingers++;
+      }
+      if (landmarks[8].y < landmarks[6].y) fingers++;
+      if (landmarks[12].y < landmarks[10].y) fingers++;
+      if (landmarks[16].y < landmarks[14].y) fingers++;
+      if (landmarks[20].y < landmarks[18].y) fingers++;
+      return fingers;
+    }
+
+    function onResults(results) {
+      ctx.save();
+      ctx.setTransform(-1, 0, 0, 1, canvas.width, 0); 
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (points.length > 0) {
+        ctx.beginPath();
+        ctx.moveTo(points[0].x, points[0].y);
+        for (let i = 1; i < points.length; i++) {
+          ctx.lineTo(points[i].x, points[i].y);
+        }
+        ctx.strokeStyle = 'lime';
+        ctx.lineWidth = 3;
+        ctx.stroke();
+      }
+
+      if (results.multiHandLandmarks && results.multiHandedness) {
+        results.multiHandLandmarks.forEach((landmarks, i) => {
+          const handedness = results.multiHandedness[i].label;
+
+          const mirroredLandmarks = landmarks.map(pt => ({
+            x: 1 - pt.x,
+            y: pt.y,
+            z: pt.z
+          }));
+
+          drawConnectors(ctx, mirroredLandmarks, HAND_CONNECTIONS, {color: 'lime', lineWidth: 2});
+          drawLandmarks(ctx, mirroredLandmarks, {color: handedness === "Left" ? "cyan" : "red", lineWidth: 1});
+
+          const fingerCount = countFingers(landmarks, handedness);
+          const now = Date.now();
+
+          if (fingerCount !== lastGesture) {
+            lastGesture = fingerCount;
+            gestureStartTime = now;
+          } else {
+            if (now - gestureStartTime > STABLE_TIME) {
+              if (fingerCount === 5) {
+                isWriting = !isWriting;
+                statusText.textContent = isWriting 
+                  ? `✏ Writing Mode ON (${handedness} Hand)`
+                  : "✋ Writing Mode OFF";
+                gestureStartTime = now + 999999;
+              }
+              if (fingerCount === 0) {
+                points = [];
+                ctx.clearRect(0,0,canvas.width,canvas.height);
+                statusText.textContent = `🧹 Canvas Cleared (${handedness} Hand)`;
+                gestureStartTime = now + 999999;
+              }
+            }
+          }
+
+          if (isWriting) {
+            const indexFinger = landmarks[8];
+            points.push({
+              x: (1 - indexFinger.x) * canvas.width,
+              y: indexFinger.y * canvas.height
+            });
+          }
+        });
+      }
+      ctx.restore();
+    }
+
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.7,
+      minTrackingConfidence: 0.7
+    });
+
+    hands.onResults(onResults);
+
+    const camera = new Camera(video, {
+      onFrame: async () => { await hands.send({image: video}); },
+      width: 640,
+      height: 480
+    });
+    camera.start();
+
+    // OCR + Voice
+    readBtn.addEventListener("click", async () => {
+      statusText.textContent = "🔍 Recognizing text...";
+      const dataUrl = canvas.toDataURL("image/png");
+      
+      const { data: { text } } = await Tesseract.recognize(dataUrl, 'eng');
+      const cleanText = text.trim();
+
+      if (cleanText) {
+        statusText.textContent = `✅ Recognized: "${cleanText}"`;
+        const utterance = new SpeechSynthesisUtterance(cleanText);
+        utterance.lang = "en-US";
+        speechSynthesis.cancel();
+        speechSynthesis.speak(utterance);
+      } else {
+        statusText.textContent = "❌ No text recognized.";
+      }
+    });
+  </script>
+</body>
+</html>
